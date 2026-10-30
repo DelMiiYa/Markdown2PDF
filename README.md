@@ -2,6 +2,12 @@
 
 A standalone desktop application for **Windows and Linux** that converts Markdown documents (with images, complex tables, inline HTML, and Thai/Unicode/Emoji typography) into clean, print-ready A4 PDFs.
 
+## AI Disclosure
+
+This is a personal project where the core application logic and source code were generated using **Google Antigravity (Gemini 4 Argon)**. 
+
+While the code generation was fully automated based on project prompts, the overall architecture layout, testing, and project configuration were directed and verified by the author.
+
 ## Key Features
 
 - **Split-Pane Live Workspace:**
