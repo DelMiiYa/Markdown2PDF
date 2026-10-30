@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "markdown2pdf"
+version = "1.0.0"
+description = "Standalone desktop studio to convert Markdown (with images, tables, and Thai/Unicode typography) into print-ready A4 PDFs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "markdown>=3.5",
+    "PyMuPDF>=1.24.0",
+    "Pillow>=10.0.0",
+]
+
+[project.urls]
+Repository = "https://github.com/DelMiiYa/Markdown2PDF"
+
+[project.gui-scripts]
+markdown2pdf = "app:main"
+
+[tool.setuptools]
+py-modules = ["app", "converter"]
