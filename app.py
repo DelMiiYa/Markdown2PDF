@@ -17,7 +17,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
+import traceback
 import urllib.parse
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -37,8 +39,77 @@ UI_FONT = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
 EDITOR_FONT = "Leelawadee UI" if sys.platform == "win32" else "Noto Sans"
 
 
+def _ensure_windows_stdio() -> None:
+    """Ensure sys.stdin/stdout/stderr are valid streams in windowed/frozen environments."""
+    if sys.stdin is None:
+        try:
+            sys.stdin = open(os.devnull, "r", encoding="utf-8")  # noqa: SIM115
+        except OSError:
+            pass
+    if sys.stdout is None:
+        try:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+        except OSError:
+            pass
+    if sys.stderr is None:
+        try:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+        except OSError:
+            pass
+
+
+_ensure_windows_stdio()
+
+
+def _get_runtime_log_path() -> Path:
+    """Return path to persistent error log in system temp directory."""
+    return Path(tempfile.gettempdir()) / "mdtopdf_runtime.log"
+
+
+def _log_render_error(context: str, exc: BaseException, extra: str = "") -> Path:
+    """Append a timestamped render error traceback to %TEMP%/mdtopdf_runtime.log."""
+    log_path = _get_runtime_log_path()
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        entry = (
+            f"[{ts}] [{context}] {type(exc).__name__}: {exc}\n"
+            f"Extra: {extra}\n"
+            f"Traceback:\n{tb}\n"
+            f"{'-' * 60}\n"
+        )
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(entry)
+    except OSError:
+        pass
+    return log_path
+
+
+def _ensure_windows_tcl_tk() -> None:
+    """Ensure TCL_LIBRARY and TK_LIBRARY are set for Windows venvs across drives."""
+    if sys.platform != "win32" or getattr(sys, "frozen", False):
+        return
+    tcl_root = Path(sys.base_prefix) / "tcl"
+    if not tcl_root.is_dir():
+        return
+    if not os.environ.get("TCL_LIBRARY"):
+        for d in sorted(tcl_root.glob("tcl8*"), reverse=True):
+            if (d / "init.tcl").is_file():
+                os.environ["TCL_LIBRARY"] = str(d)
+                break
+    if not os.environ.get("TK_LIBRARY"):
+        for d in sorted(tcl_root.glob("tk8*"), reverse=True):
+            if (d / "tk.tcl").is_file():
+                os.environ["TK_LIBRARY"] = str(d)
+                break
+
+
+_ensure_windows_tcl_tk()
+
+
 def _enable_windows_hidpi() -> None:
     """Enable High-DPI scaling on Windows so text and preview pages are sharp."""
+    _ensure_windows_tcl_tk()
     if sys.platform == "win32":
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -82,6 +153,7 @@ class MdToPdfStudioApp:
         ] = queue.Queue()
         self._render_lock = threading.Lock()
         self._render_generation: int = 0
+        self._is_exporting: bool = False
         self._debounce_after_id: str | None = None
         self._syntax_after_id: str | None = None
         self._resize_after_id: str | None = None
@@ -591,6 +663,11 @@ class MdToPdfStudioApp:
     def new_document(self) -> None:
         if not self._confirm_discard_changes():
             return
+        if self._debounce_after_id:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(self._debounce_after_id)
+            self._debounce_after_id = None
+        self._render_generation += 1
         self.current_file = None
         self.is_modified = False
         self.editor.delete("1.0", tk.END)
@@ -712,7 +789,7 @@ class MdToPdfStudioApp:
         except ValueError:
             md_ref = chosen.as_uri()
 
-        alt_text = chosen.stem
+        alt_text = re.sub(r"[\[\]]", "", chosen.stem).strip() or "image"
         tag = f"![{alt_text}]({md_ref})"
         self.editor.insert(tk.INSERT, tag)
         self.editor.focus_set()
@@ -748,6 +825,8 @@ class MdToPdfStudioApp:
         )
 
     def export_pdf_dialog(self) -> None:
+        if self._is_exporting:
+            return
         md_text = self.editor.get("1.0", "end-1c")
         if not md_text.strip():
             messagebox.showwarning(
@@ -771,6 +850,7 @@ class MdToPdfStudioApp:
         if not out_path:
             return
 
+        self._is_exporting = True
         self.var_status.set(f"Exporting PDF to {out_path}...")
         self.btn_export.config(state=tk.DISABLED)
         self.root.config(cursor="watch")
@@ -783,9 +863,10 @@ class MdToPdfStudioApp:
 
         def _export_worker() -> None:
             try:
-                outcome["result"] = render_pdf(
-                    md_text, base_dir_str, out_path, options
-                )
+                with self._render_lock:
+                    outcome["result"] = render_pdf(
+                        md_text, base_dir_str, out_path, options
+                    )
             except Exception as exc:  # noqa: BLE001
                 outcome["error"] = exc
             finally:
@@ -794,24 +875,30 @@ class MdToPdfStudioApp:
         worker = threading.Thread(target=_export_worker, daemon=True)
         worker.start()
 
-        # Keep Tkinter event loop responsive while export runs on worker thread
-        while not done_event.wait(timeout=0.02):
-            if self._closing:
-                return
-            with contextlib.suppress(tk.TclError):
-                self.root.update()
-
-        self.root.config(cursor="")
-        self.btn_export.config(state=tk.NORMAL)
+        try:
+            # Keep Tkinter event loop responsive while export runs on worker thread
+            while not done_event.wait(timeout=0.02):
+                if self._closing:
+                    return
+                with contextlib.suppress(tk.TclError):
+                    self.root.update()
+        finally:
+            self._is_exporting = False
+            if not self._closing:
+                with contextlib.suppress(tk.TclError):
+                    self.root.config(cursor="")
+                    self.btn_export.config(state=tk.NORMAL)
 
         if "error" in outcome:
             exc = outcome["error"]
+            log_path = _log_render_error("Export PDF", exc, f"Destination: {out_path}")
             messagebox.showerror(
                 "PDF Export Failed",
-                f"An error occurred while exporting the PDF:\n{exc}",
+                f"An error occurred while exporting the PDF:\n{exc}\n\n"
+                f"Full diagnostic log written to:\n{log_path}",
                 parent=self.root,
             )
-            self.var_status.set("PDF export failed.")
+            self.var_status.set(f"PDF export failed (see {log_path.name}).")
             return
 
         res: ConversionResult = outcome["result"]
@@ -894,15 +981,19 @@ class MdToPdfStudioApp:
             self.editor.tag_remove(tag, "1.0", tk.END)
 
         text = self.editor.get("1.0", "end-1c")
-        in_code_fence = False
+        active_fence: str | None = None
         for line_idx, line in enumerate(text.split("\n"), start=1):
             stripped = line.lstrip()
             if stripped.startswith(("```", "~~~")):
-                in_code_fence = not in_code_fence
+                marker = "```" if stripped.startswith("```") else "~~~"
+                if active_fence is None:
+                    active_fence = marker
+                elif active_fence == marker:
+                    active_fence = None
                 self.editor.tag_add("md_code", f"{line_idx}.0", f"{line_idx}.end")
                 continue
 
-            if in_code_fence:
+            if active_fence is not None:
                 self.editor.tag_add("md_code", f"{line_idx}.0", f"{line_idx}.end")
                 continue
 
@@ -935,6 +1026,7 @@ class MdToPdfStudioApp:
     def trigger_preview_render(self) -> None:
         md_text = self.editor.get("1.0", "end-1c")
         if not md_text.strip():
+            self._render_generation += 1
             self._raw_pil_pages.clear()
             self._tk_page_images.clear()
             self._scaled_img_cache.clear()
@@ -967,17 +1059,19 @@ class MdToPdfStudioApp:
         with self._render_lock:
             if self._closing or gen != self._render_generation:
                 return
+            gen_pdf_path = self._temp_dir / f"_preview_{gen}.pdf"
             try:
-                gen_pdf_path = self._temp_dir / f"_preview_{gen}.pdf"
                 res = render_pdf(md_text, base_dir_str, str(gen_pdf_path), options)
                 pil_pages = render_pdf_pages_to_pil(str(gen_pdf_path), dpi=115)
-                with contextlib.suppress(OSError):
-                    gen_pdf_path.unlink()
                 if not self._closing:
                     self._render_queue.put(("success", gen, res, pil_pages))
             except Exception as exc:  # noqa: BLE001
+                _log_render_error("Live Preview", exc, f"Generation: {gen}")
                 if not self._closing:
                     self._render_queue.put(("error", gen, str(exc), []))
+            finally:
+                with contextlib.suppress(OSError):
+                    gen_pdf_path.unlink()
 
     def _poll_render_queue(self) -> None:
         if self._closing:
@@ -1011,7 +1105,9 @@ class MdToPdfStudioApp:
                     self._redraw_preview_canvas()
                 else:
                     self.var_page_badge.set("Render error")
-                    self.var_status.set(f"Preview error: {payload}")
+                    self.var_status.set(
+                        f"Preview error: {payload} (details in mdtopdf_runtime.log)"
+                    )
         except queue.Empty:
             pass
         finally:

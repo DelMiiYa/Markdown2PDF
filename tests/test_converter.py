@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile as tf
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import psutil
@@ -205,7 +206,7 @@ def test_remote_and_data_uri_images_untouched(tmp_path: Path) -> None:
     assert _is_remote_or_data_uri("https://example.com/a.png") is True
     assert _is_remote_or_data_uri("http://example.com/a.png") is True
     assert _is_remote_or_data_uri("data:image/png;base64,iVBORw0KGgo=") is True
-    assert _is_remote_or_data_uri("file:///C:/test.png") is True
+    assert _is_remote_or_data_uri("file:///C:/test.png") is False
     assert _is_remote_or_data_uri("images/local.png") is False
 
     md = (
@@ -667,3 +668,268 @@ def test_real_browser_end_to_end_conversion_and_preview(
     assert pil_pages[0].mode == "RGB"
     assert pil_pages[0].width > 500
     assert pil_pages[0].height > 700
+
+
+# ---------------------------------------------------------------------------
+# 12. Audit Verification Tests (Verifying Remediated Edge Cases & Security)
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_html_preserves_code_blocks_and_prose_with_on_equals(
+    tmp_path: Path,
+) -> None:
+    """Verify F-01 fix: _sanitize_html preserves 'on... = ...' inside <code> and prose."""
+    md = (
+        "When the sensor has on_state = 1, check the status.\n\n"
+        "```python\n"
+        "def configure():\n"
+        "    online = True\n"
+        '    on_error = "retry"\n'
+        "    return online\n"
+        "```\n"
+    )
+    html, _ = build_html(md, str(tmp_path), ConversionOptions())
+
+    assert "online = True" in html
+    assert "on_error = &quot;retry&quot;" in html or 'on_error = "retry"' in html
+    assert "on_state = 1" in html
+
+
+def test_wrap_h3_list_blocks_does_not_overwrap_across_non_list_h3(
+    tmp_path: Path,
+) -> None:
+    """Verify F-02 fix: _wrap_h3_list_blocks only wraps <h3> immediately followed by list."""
+    md = (
+        "### 1.1 Overview Without List\n\n"
+        "This introductory paragraph should NOT be wrapped in station-block.\n\n"
+        "## 2. Main Section\n\n"
+        "### 2.1 Checklist With List\n\n"
+        "- Item A\n"
+        "- Item B\n"
+    )
+    html, _ = build_html(
+        md, str(tmp_path), ConversionOptions(keep_blocks_together=True)
+    )
+
+    assert (
+        '<div class="station-block"><h3>1.1 Overview Without List</h3>' not in html
+    )
+    assert '<div class="station-block"><h3>2.1 Checklist With List</h3>' in html
+
+
+def test_file_uri_enforces_allow_outside_base_dir_and_missing_suppression(
+    tmp_path: Path,
+) -> None:
+    """Verify F-03 fix: file:// URIs and suppress_missing_images=False enforce containment."""
+    outside_img = tmp_path / "outside_secret.png"
+    Image.new("RGB", (10, 10), color=(255, 0, 0)).save(outside_img, format="PNG")
+    outside_uri = outside_img.resolve().as_uri()
+
+    sub_base = tmp_path / "workspace"
+    sub_base.mkdir(exist_ok=True)
+    missing_inside_uri = (sub_base / "nonexistent_file.png").resolve().as_uri()
+
+    md = (
+        f"![OutsideFileURI]({outside_uri})\n\n"
+        f"![MissingFileURI]({missing_inside_uri})\n\n"
+        "![RemoteFileHost](file://attacker.com/share/a.png)\n\n"
+        "![OutsideRel](../outside_secret.png)\n"
+    )
+
+    # 1. With suppress_missing_images=True and allow_outside_base_dir=False (default):
+    # All four are blocked/suppressed!
+    html_sup, suppressed = build_html(
+        md,
+        str(sub_base),
+        ConversionOptions(
+            suppress_missing_images=True, allow_outside_base_dir=False
+        ),
+    )
+    assert outside_uri not in html_sup
+    assert missing_inside_uri not in html_sup
+    assert "attacker.com" not in html_sup
+    assert len(suppressed) == 4
+
+    # 2. With suppress_missing_images=False and allow_outside_base_dir=False:
+    # Security-disallowed '../outside_secret.png' is still stripped so <base href>
+    # cannot resolve it!
+    html_nosup, sup_nosup = build_html(
+        '![OutsideRel](../outside_secret.png)\n\n<img src="../outside_secret.png">',
+        str(sub_base),
+        ConversionOptions(
+            suppress_missing_images=False, allow_outside_base_dir=False
+        ),
+    )
+    assert "outside_secret.png" not in html_nosup
+    assert "../outside_secret.png" in sup_nosup
+
+
+def test_sanitize_html_blocks_unquoted_href_entity_scheme_slash_onload_and_style(
+    tmp_path: Path,
+) -> None:
+    """Verify F-04 fix: _sanitize_html strips unquoted/entity hrefs, <img/onerror=>, <style>."""
+    md = (
+        "<a href=file:///C:/Windows/win.ini>Unquoted File</a>\n\n"
+        '<a href="&#106;avascript:alert(1)">Entity JS</a>\n\n'
+        "<a href='https://example.com'>Safe Single Quote</a>\n\n"
+        '<div><img/src="https://example.com/a.png"/onerror="alert(1)"></div>\n\n'
+        "<style>body { display: none; }</style>\n"
+    )
+    html, _ = build_html(md, str(tmp_path), ConversionOptions())
+
+    assert "win.ini" not in html
+    assert "alert(1)" not in html
+    assert "onerror=" not in html
+    assert "display: none" not in html
+    assert html.count("<style>") == 1
+    assert "https://example.com" in html
+
+
+def test_local_image_apostrophe_in_filename_resolved(tmp_path: Path) -> None:
+    """Verify F-08 fix: Image filenames with single quotes (') resolve cleanly."""
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(exist_ok=True)
+    apos_img = img_dir / "user's_diagram.png"
+    Image.new("RGB", (20, 20), color=(10, 20, 30)).save(apos_img, format="PNG")
+
+    md = "![Diagram](images/user's_diagram.png)"
+    html, suppressed = build_html(
+        md, str(tmp_path), ConversionOptions(suppress_missing_images=True)
+    )
+
+    assert suppressed == []
+    assert apos_img.resolve().as_uri() in html
+
+
+def test_preprocess_markdown_double_backtick_inline_code_masked(
+    tmp_path: Path,
+) -> None:
+    """Verify F-10 fix: Double-backtick inline code spans ``... ` ...`` are masked."""
+    md = "Double-backtick span: ``prefix ` ![Example](images/missing_in_double_ticks.png)``"
+    html, suppressed = build_html(
+        md, str(tmp_path), ConversionOptions(suppress_missing_images=True)
+    )
+
+    assert suppressed == []
+    assert "missing_in_double_ticks.png" in html
+
+
+def test_resolve_local_image_angle_brackets_and_unclosed_h3_list(
+    tmp_path: Path, sample_png: Path
+) -> None:
+    """Cover angle-bracket wrapping in _resolve_local_image and unclosed list in _wrap_h3_list_blocks."""
+    exists, resolved = _resolve_local_image(
+        "<images/sample.png>", str(tmp_path), allow_outside_base=False
+    )
+    assert exists is True
+    assert resolved == sample_png.resolve()
+
+    raw_unclosed = "<h3>Unclosed List Heading</h3><ul><li>Item without closing ul"
+    wrapped = converter._wrap_h3_list_blocks(raw_unclosed)
+    assert wrapped == raw_unclosed
+
+
+def test_linux_browser_discovery_and_no_sandbox_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify Linux candidate discovery, MDTOPDF_BROWSER command name, and --no-sandbox flag."""
+    monkeypatch.setenv("MDTOPDF_BROWSER", "custom-chromium-bin")
+    monkeypatch.setattr(
+        converter.shutil,
+        "which",
+        lambda cmd: "/opt/bin/custom-chromium" if cmd == "custom-chromium-bin" else None,
+    )
+    assert find_browser_executable() == "/opt/bin/custom-chromium"
+
+    monkeypatch.delenv("MDTOPDF_BROWSER", raising=False)
+    monkeypatch.setattr(converter.sys, "platform", "linux")
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda self: str(self).replace("\\", "/") == "/usr/bin/chromium",
+    )
+    assert find_browser_executable() == "/usr/bin/chromium"
+
+    captured_cmd: list[str] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> MagicMock:
+        captured_cmd.extend(cmd)
+        return MagicMock(returncode=1, stderr="simulated exit")
+
+    monkeypatch.setenv("CI", "true")
+    with (
+        patch("converter.find_browser_executable", return_value="/usr/bin/chromium"),
+        patch("converter.subprocess.run", side_effect=fake_run),
+        pytest.raises(RuntimeError, match="Browser PDF rendering failed"),
+    ):
+        render_pdf("# Linux CI", str(tmp_path), str(tmp_path / "linux.pdf"))
+
+    assert "--no-sandbox" in captured_cmd
+
+
+def test_render_pdf_passes_devnull_and_isolation_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify render_pdf passes stdin=DEVNULL and isolation flags to subprocess.run."""
+    captured_kwargs: dict[str, Any] = {}
+    captured_cmd: list[str] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> MagicMock:
+        captured_cmd.extend(cmd)
+        captured_kwargs.update(kwargs)
+        # Create the fake output PDF so _wait_for_file_ready succeeds
+        pdf_arg = next(arg for arg in cmd if arg.startswith("--print-to-pdf="))
+        out_pdf = Path(pdf_arg.split("=", 1)[1])
+        out_pdf.write_bytes(b"%PDF-1.4 simulated pdf")
+        return MagicMock(returncode=0, stderr="")
+
+    mock_doc = MagicMock()
+    mock_doc.__len__.return_value = 1
+    mock_page = MagicMock()
+    mock_page.get_images.return_value = []
+    mock_doc.__getitem__.return_value = mock_page
+
+    with (
+        patch("converter.find_browser_executable", return_value="dummy_browser.exe"),
+        patch("converter.subprocess.run", side_effect=fake_run),
+        patch("converter._open_pdf_with_retry", return_value=mock_doc),
+    ):
+        res = render_pdf("# Heading", str(tmp_path), str(tmp_path / "out.pdf"))
+
+    assert res.page_count == 1
+    assert captured_kwargs.get("stdin") == subprocess.DEVNULL
+    assert any(arg.startswith("--crash-dumps-dir=") for arg in captured_cmd)
+    assert "--disable-background-networking" in captured_cmd
+    assert "--disable-sync" in captured_cmd
+    assert "--disable-default-apps" in captured_cmd
+
+
+def test_wait_for_file_ready(tmp_path: Path) -> None:
+    """Verify _wait_for_file_ready returns True for existing non-empty file and False on timeout."""
+    empty_file = tmp_path / "empty.txt"
+    empty_file.write_bytes(b"")
+    assert converter._wait_for_file_ready(empty_file, timeout=0.05, poll_interval=0.01) is False
+
+    non_empty = tmp_path / "ready.txt"
+    non_empty.write_bytes(b"content")
+    assert converter._wait_for_file_ready(non_empty, timeout=0.1, poll_interval=0.01) is True
+
+
+def test_open_pdf_with_retry_retries_on_transient_error() -> None:
+    """Verify _open_pdf_with_retry retries on PermissionError and returns document."""
+    attempts = [0]
+    mock_doc = MagicMock()
+
+    def fake_open(path: str) -> MagicMock:
+        attempts[0] += 1
+        if attempts[0] < 3:
+            raise PermissionError("File in use by scanner")
+        return mock_doc
+
+    with patch("converter.pymupdf.open", side_effect=fake_open):
+        doc = converter._open_pdf_with_retry("dummy.pdf", retries=5, delay=0.01)
+
+    assert doc is mock_doc
+    assert attempts[0] == 3
+
+

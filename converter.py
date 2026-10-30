@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import html
+import math
 import os
 import re
 import shutil
@@ -16,9 +17,9 @@ import sys
 import tempfile
 import time
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import markdown
 import pymupdf
@@ -64,8 +65,12 @@ MARGIN_PRESETS: dict[str, str] = {
 def find_browser_executable() -> str:
     """Locate Microsoft Edge, Google Chrome, or Chromium on Windows or Linux."""
     env_override = os.environ.get("MDTOPDF_BROWSER", "").strip()
-    if env_override and Path(env_override).is_file():
-        return env_override
+    if env_override:
+        if Path(env_override).is_file():
+            return env_override
+        which_override = shutil.which(env_override)
+        if which_override:
+            return which_override
 
     candidates: list[str] = []
     if sys.platform == "win32":
@@ -124,27 +129,35 @@ def find_browser_executable() -> str:
 
 
 def _is_remote_or_data_uri(src: str) -> bool:
-    """Return True if the image source is an external HTTP(S), data, or file URI."""
+    """Return True if the image source is an external HTTP(S) or data URI."""
     lowered = src.strip().lower()
-    return lowered.startswith(("http://", "https://", "data:", "file://"))
+    return lowered.startswith(("http://", "https://", "data:"))
 
 
-def _resolve_local_image(
+def _parse_local_candidate(
     src: str, base_dir: str, allow_outside_base: bool = False
-) -> tuple[bool, Path | None]:
-    """Resolve a local image path (HTML-escaped or URL-encoded) against base_dir.
+) -> tuple[bool, bool, Path | None]:
+    """Parse and validate a local image path or file:// URI against base_dir.
 
-    Blocks Windows UNC/network paths and enforces base_dir containment unless
-    allow_outside_base is True.
-    Returns (exists, resolved_path).
+    Returns (exists, is_allowed, resolved_path).
     """
     cleaned = html.unescape(src.strip())
     if cleaned.startswith("<") and cleaned.endswith(">"):
         cleaned = cleaned[1:-1].strip()
 
-    unquoted = urllib.parse.unquote(cleaned)
+    if cleaned.lower().startswith("file:"):
+        parsed = urllib.parse.urlsplit(cleaned)
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            return False, False, None
+        uri_path = urllib.parse.unquote(parsed.path)
+        if sys.platform == "win32" and re.match(r"^/[a-zA-Z]:", uri_path):
+            uri_path = uri_path[1:]
+        unquoted = uri_path
+    else:
+        unquoted = urllib.parse.unquote(cleaned)
+
     if not unquoted or unquoted.startswith(("\\\\", "//")):
-        return False, None
+        return False, False, None
 
     try:
         base_resolved = Path(base_dir).resolve()
@@ -153,10 +166,27 @@ def _resolve_local_image(
             candidate = base_resolved / candidate
         resolved = candidate.resolve()
         if not allow_outside_base and not resolved.is_relative_to(base_resolved):
-            return False, None
-        return resolved.is_file(), resolved
+            return False, False, None
+        return resolved.is_file(), True, resolved
     except (OSError, ValueError):
+        return False, False, None
+
+
+def _resolve_local_image(
+    src: str, base_dir: str, allow_outside_base: bool = False
+) -> tuple[bool, Path | None]:
+    """Resolve a local image path (HTML-escaped, URL-encoded, or file://) against base_dir.
+
+    Blocks Windows UNC/network paths and enforces base_dir containment unless
+    allow_outside_base is True.
+    Returns (exists, resolved_path).
+    """
+    exists, is_allowed, resolved = _parse_local_candidate(
+        src, base_dir, allow_outside_base
+    )
+    if not is_allowed:
         return False, None
+    return exists, resolved
 
 
 def preprocess_markdown(
@@ -165,16 +195,16 @@ def preprocess_markdown(
     """Inspect Markdown image references against base_dir outside of code blocks.
 
     Strips leading UTF-8 BOM, rewrites valid local image paths with spaces or
-    parentheses into file:/// URIs, and strips missing local image tags when
-    options.suppress_missing_images is True.
+    parentheses into file:/// URIs, and strips missing or disallowed local image
+    tags.
     """
     md_text = md_text.lstrip("\ufeff")
     suppressed: list[str] = []
 
-    # Mask fenced and inline code spans so image syntax inside code is untouched
+    # Mask fenced (3+ backticks/tildes) and inline (1+ backticks) code blocks
     masked_blocks: list[str] = []
     code_pattern = re.compile(
-        r"(^```[^\n]*\n.*?^```|^~~~[^\n]*\n.*?^~~~|`[^`\n]+`)",
+        r"(^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n.*?^[ \t]{0,3}\2[ \t]*$|(`+)(?:(?!\3)[^\n])+\3)",
         flags=re.MULTILINE | re.DOTALL,
     )
 
@@ -207,18 +237,18 @@ def preprocess_markdown(
                 src_path = title_match.group(1).strip()
                 title_suffix = f" {title_match.group(2)}"
             else:
-                src_path = raw_target.split('"')[0].split("'")[0].strip()
+                src_path = raw_target.strip()
 
         if _is_remote_or_data_uri(src_path):
             return match.group(0)
 
-        exists, resolved_path = _resolve_local_image(
+        exists, is_allowed, resolved_path = _parse_local_candidate(
             src_path, base_dir, options.allow_outside_base_dir
         )
-        if exists and resolved_path is not None:
+        if exists and is_allowed and resolved_path is not None:
             return f"![{alt_text}]({resolved_path.as_uri()}{title_suffix})"
 
-        if options.suppress_missing_images:
+        if not is_allowed or options.suppress_missing_images:
             suppressed.append(src_path)
             return ""
         return match.group(0)
@@ -236,7 +266,8 @@ def _resolve_html_image_uris(
 ) -> str:
     """Rewrite relative <img src="..."> attributes in generated HTML to file:/// URIs.
 
-    Also suppresses missing or disallowed local HTML <img> tags when configured.
+    Always strips security-disallowed paths (UNC or outside base_dir), and strips
+    missing local HTML <img> tags when options.suppress_missing_images is True.
     """
     img_tag_pattern = re.compile(
         r'<img\b([^>]*?)\bsrc=(["\'])([^"\']+)\2([^>]*?)/?>', re.IGNORECASE
@@ -253,14 +284,14 @@ def _resolve_html_image_uris(
         if _is_remote_or_data_uri(unescaped_src):
             return match.group(0)
 
-        exists, resolved_path = _resolve_local_image(
+        exists, is_allowed, resolved_path = _parse_local_candidate(
             unescaped_src, base_dir, options.allow_outside_base_dir
         )
-        if exists and resolved_path is not None:
+        if exists and is_allowed and resolved_path is not None:
             file_uri = resolved_path.as_uri()
             return f"<img{before}src={quote}{file_uri}{quote}{after} />"
 
-        if options.suppress_missing_images:
+        if not is_allowed or options.suppress_missing_images:
             if unescaped_src not in suppressed:
                 suppressed.append(unescaped_src)
             return ""
@@ -274,43 +305,61 @@ def _sanitize_html(html_body: str) -> str:
     """Strip dangerous HTML elements, inline event handlers, and unsafe URI schemes."""
     # Remove paired dangerous blocks (<script>, <iframe>, <object>, <applet>, <style>)
     paired_tag_pattern = re.compile(
-        r"<(script|iframe|object|applet)\b[^>]*>.*?</\1\s*>",
+        r"<(script|iframe|object|applet|style)\b[^>]*>.*?</\1\s*>",
         flags=re.IGNORECASE | re.DOTALL,
     )
     sanitized = paired_tag_pattern.sub("", html_body)
 
     # Remove standalone/void dangerous tags
     void_tag_pattern = re.compile(
-        r"</?(?:script|iframe|object|embed|applet|meta|link|base)\b[^>]*/?>",
+        r"</?(?:script|iframe|object|embed|applet|style|meta|link|base|frame|frameset|form)\b"
+        r"(?:[^>'\"/]|\"[^\"]*\"|'[^']*'|/)*>",
         flags=re.IGNORECASE,
     )
     sanitized = void_tag_pattern.sub("", sanitized)
 
-    # Strip inline event handlers (onerror=, onload=, onclick=, etc.)
     event_attr_pattern = re.compile(
-        r"""\s+on[a-z0-9_]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>/]+)""",
+        r"""(?:[\s/]+)on[a-z0-9_]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>/]+)""",
         flags=re.IGNORECASE,
     )
-    sanitized = event_attr_pattern.sub("", sanitized)
-
-    # Neutralize javascript:, vbscript:, and file: links in href/action attributes
-    unsafe_href_pattern = re.compile(
-        r"""(\b(?:href|action)\s*=\s*["'])\s*(?:javascript:|vbscript:|file:)[^"']*""",
+    attr_uri_pattern = re.compile(
+        r"""(\b(?:href|action|formaction)\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s>"']+))""",
         flags=re.IGNORECASE,
     )
-    sanitized = unsafe_href_pattern.sub(r"\1#", sanitized)
 
-    return sanitized
+    def _clean_uri_attr(attr_match: re.Match[str]) -> str:
+        prefix = attr_match.group(1)
+        raw_val = (
+            attr_match.group(2)
+            or attr_match.group(3)
+            or attr_match.group(4)
+            or ""
+        )
+        normalized = re.sub(r"[\x00-\x20]+", "", html.unescape(raw_val)).lower()
+        if normalized.startswith(("javascript:", "vbscript:", "file:", "data:")):
+            return f'{prefix}"#"'
+        return attr_match.group(0)
+
+    def _sanitize_opening_tag(tag_match: re.Match[str]) -> str:
+        tag_text = tag_match.group(0)
+        tag_text = event_attr_pattern.sub("", tag_text)
+        return attr_uri_pattern.sub(_clean_uri_attr, tag_text)
+
+    opening_tag_pattern = re.compile(
+        r"<[a-zA-Z][a-zA-Z0-9:-]*(?:[^>'\"/]|\"[^\"]*\"|'[^']*'|/)*>"
+    )
+    return opening_tag_pattern.sub(_sanitize_opening_tag, sanitized)
 
 
 def _wrap_h3_list_blocks(html_body: str) -> str:
     """Wrap <h3> headings and their immediately following top-level <ul>/<ol> in a div.
 
     Correctly tracks nested <ul>/<ol> tags so nested lists do not close the wrapper
-    prematurely.
+    prematurely, and never spans across intermediate </h3> tags.
     """
     h3_open_pattern = re.compile(
-        r"<h3[^>]*>.*?</h3>\s*<(ul|ol)\b[^>]*>", flags=re.IGNORECASE | re.DOTALL
+        r"<h3\b[^>]*>(?:(?!</h3\s*>).)*?</h3\s*>\s*<(ul|ol)\b[^>]*>",
+        flags=re.IGNORECASE | re.DOTALL,
     )
     list_token_pattern = re.compile(r"<(/?)(ul|ol)\b[^>]*>", flags=re.IGNORECASE)
 
@@ -360,14 +409,16 @@ def build_css(options: ConversionOptions) -> str:
     accent = _clean_css_token(options.accent_color) or "#0d47a1"
     page_size = _clean_css_token(options.page_size) or "A4 portrait"
     margin_css = _clean_css_token(options.margin_css) or "12mm 14mm"
-    font_pt = float(options.font_size_pt)
-    line_h = float(options.line_height)
-    img_w = int(options.img_max_width)
-    img_h = int(options.img_max_height)
+    raw_font = float(options.font_size_pt)
+    font_pt = min(72.0, max(6.0, raw_font if math.isfinite(raw_font) else 9.5))
+    raw_lh = float(options.line_height)
+    line_h = min(3.0, max(1.0, raw_lh if math.isfinite(raw_lh) else 1.45))
+    img_w = max(16, int(options.img_max_width))
+    img_h = max(16, int(options.img_max_height))
 
     font_stack = (
-        "'Leelawadee UI', 'Tahoma', 'Noto Sans Thai', "
-        "'Segoe UI Symbol', 'Segoe UI Emoji', sans-serif"
+        "'Leelawadee UI', 'Tahoma', 'Noto Sans Thai', 'Noto Sans', "
+        "'Segoe UI Symbol', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif"
     )
 
     return f"""
@@ -484,7 +535,7 @@ p > img {{
     margin: 6px auto;
 }}
 code {{
-    font-family: 'Consolas', 'Courier New', monospace;
+    font-family: 'Consolas', 'Noto Sans Mono', 'DejaVu Sans Mono', 'Courier New', monospace;
     font-size: 0.88em;
     background-color: #f3f4f6;
     padding: 1px 4px;
@@ -570,6 +621,41 @@ def build_html(
     return full_html, suppressed
 
 
+def _wait_for_file_ready(
+    path: Path, timeout: float = 3.0, poll_interval: float = 0.05
+) -> bool:
+    """Poll until path exists and has non-zero size, absorbing filesystem/AV flush latency."""
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                return True
+        except OSError:
+            pass
+        time.sleep(poll_interval)
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _open_pdf_with_retry(
+    pdf_path: str, retries: int = 25, delay: float = 0.06
+) -> Any:
+    """Open a PDF with PyMuPDF, retrying transient file-sharing locks from AV or browser."""
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return pymupdf.open(pdf_path)
+        except (PermissionError, pymupdf.FileDataError, OSError) as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(delay)
+    if last_exc:
+        raise last_exc
+    return pymupdf.open(pdf_path)
+
+
 def render_pdf(
     md_text: str,
     base_dir: str,
@@ -609,6 +695,10 @@ def render_pdf(
                 "--no-default-browser-check",
                 "--disable-extensions",
                 f"--user-data-dir={profile_dir}",
+                f"--crash-dumps-dir={profile_dir}",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--disable-default-apps",
                 "--no-pdf-header-footer",
                 f"--print-to-pdf={out_path}",
             ]
@@ -623,6 +713,7 @@ def render_pdf(
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             proc = subprocess.run(
                 cmd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -631,7 +722,8 @@ def render_pdf(
                 timeout=60,
                 check=False,
             )
-            if proc.returncode != 0 or not out_path.is_file():
+            file_ready = _wait_for_file_ready(out_path, timeout=3.0)
+            if proc.returncode != 0 or not file_ready:
                 raise RuntimeError(
                     f"Browser PDF rendering failed (exit {proc.returncode}): "
                     f"{proc.stderr}"
@@ -642,7 +734,7 @@ def render_pdf(
                 temp_html_path.unlink()
 
     # Inspect generated PDF with PyMuPDF
-    doc = pymupdf.open(str(out_path))
+    doc: Any = _open_pdf_with_retry(str(out_path))  # type: ignore[no-untyped-call]
     try:
         page_count = len(doc)
         embedded_images = sum(
@@ -666,7 +758,7 @@ def render_pdf_pages_to_pil(
 ) -> list[Image.Image]:
     """Render all pages of a PDF file into PIL Image objects for GUI preview display."""
     images: list[Image.Image] = []
-    doc = pymupdf.open(pdf_path)
+    doc: Any = _open_pdf_with_retry(pdf_path)  # type: ignore[no-untyped-call]
     try:
         for page_idx in range(len(doc)):
             page = doc[page_idx]
