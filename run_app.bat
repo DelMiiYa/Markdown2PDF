@@ -1,3 +1,7 @@
 @echo off
 cd /d "%~dp0"
-start "" pythonw -X utf8 app.py %*
+if exist ".venv\Scripts\pythonw.exe" (
+    start "" ".venv\Scripts\pythonw.exe" -X utf8 app.py %*
+) else (
+    start "" pythonw -X utf8 app.py %*
+)

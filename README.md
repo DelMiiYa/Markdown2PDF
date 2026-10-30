@@ -26,8 +26,8 @@ While the code generation was fully automated based on project prompts, the over
 
 ## Prerequisites
 
-- **OS:** Windows 10/11 or Linux (x86_64)
-- **Browser Engine:** Microsoft Edge, Google Chrome, or Chromium installed on the system (used in headless mode for high-fidelity Skia PDF output)
+- **OS:** Windows 10/11 or Linux (x86_64; on Linux, install `python3-tk`, `fonts-noto-core`, and `fonts-noto-color-emoji` for Thai/Emoji rendering)
+- **Browser Engine:** Microsoft Edge, Google Chrome, or Chromium installed on the system (used in headless mode for high-fidelity Skia PDF output; can also be overridden via the `MDTOPDF_BROWSER` environment variable)
 - **Python:** Python 3.10+ (when running from source)
 
 ---

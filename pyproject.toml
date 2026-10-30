@@ -4,20 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "markdown2pdf"
-version = "1.0.0"
+version = "1.1.0"
 description = "Standalone desktop studio to convert Markdown (with images, tables, and Thai/Unicode typography) into print-ready A4 PDFs."
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 classifiers = [
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "markdown>=3.5",
-    "PyMuPDF>=1.24.0",
-    "Pillow>=10.0.0",
+    "markdown>=3.5,<4.0",
+    "PyMuPDF>=1.24.0,<2.0.0",
+    "Pillow>=10.0.0,<14.0.0",
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0.0,<7.0.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "bandit>=1.7",
+    "types-Markdown",
 ]
 
 [project.urls]
@@ -28,3 +41,7 @@ markdown2pdf = "app:main"
 
 [tool.setuptools]
 py-modules = ["app", "converter"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

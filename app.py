@@ -1,11 +1,13 @@
-"""
-MD-to-PDF Desktop Studio
+"""MD-to-PDF Desktop Studio.
+
 Standalone Python GUI application with a split-pane Markdown editor and
 pixel-accurate A4 print-styled PDF preview.
 """
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import ctypes
 import os
 import queue
@@ -16,10 +18,10 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
+import urllib.parse
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
-import urllib.parse
+from typing import Any
 
 from PIL import Image, ImageTk
 
@@ -31,50 +33,58 @@ from converter import (
     render_pdf_pages_to_pil,
 )
 
+UI_FONT = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
+EDITOR_FONT = "Leelawadee UI" if sys.platform == "win32" else "Noto Sans"
+
 
 def _enable_windows_hidpi() -> None:
     """Enable High-DPI scaling on Windows so text and preview pages are sharp."""
     if sys.platform == "win32":
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            try:
+        except (AttributeError, OSError):
+            with contextlib.suppress(AttributeError, OSError):
                 ctypes.windll.user32.SetProcessDPIAware()
-            except Exception:
-                pass
 
 
 class MdToPdfStudioApp:
     """Main Tkinter desktop application class for MD-to-PDF Studio."""
 
-    def __init__(self, root: tk.Tk, initial_file: Optional[str] = None) -> None:
+    def __init__(self, root: tk.Tk, initial_file: str | None = None) -> None:
+        """Initialize the studio workspace, state variables, and background queue."""
         self.root = root
         self.root.title("MD-to-PDF Desktop Studio")
         self.root.geometry("1380x860")
         self.root.minsize(980, 620)
 
         # Workspace & document state
-        self.current_file: Optional[Path] = None
+        self.current_file: Path | None = None
         self.base_dir: Path = Path.cwd()
         self.is_modified: bool = False
+        self._closing: bool = False
 
         # Temp directory for live preview PDFs
         self._temp_dir = Path(tempfile.mkdtemp(prefix="mdtopdf_studio_"))
-        self._preview_pdf_path = self._temp_dir / "_live_preview.pdf"
-        self._last_rendered_result: Optional[ConversionResult] = None
+        atexit.register(shutil.rmtree, self._temp_dir, True)
+        self._last_rendered_result: ConversionResult | None = None
 
-        # Preview image state
+        # Preview image & cache state
         self._raw_pil_pages: list[Image.Image] = []
         self._tk_page_images: list[ImageTk.PhotoImage] = []
+        self._scaled_img_cache: dict[tuple[int, int, int], ImageTk.PhotoImage] = {}
         self._page_y_coords: list[int] = []
         self._zoom_level: float = 1.0
+        self._last_canvas_width: int = 0
 
         # Threading / debounce state
-        self._render_queue: queue.Queue = queue.Queue()
+        self._render_queue: queue.Queue[
+            tuple[str, int, Any, list[Image.Image]]
+        ] = queue.Queue()
+        self._render_lock = threading.Lock()
         self._render_generation: int = 0
-        self._is_rendering: bool = False
-        self._debounce_after_id: Optional[str] = None
-        self._syntax_after_id: Optional[str] = None
+        self._debounce_after_id: str | None = None
+        self._syntax_after_id: str | None = None
+        self._resize_after_id: str | None = None
 
         # Tk variables for layout & styling controls
         self.var_font_size = tk.DoubleVar(value=9.5)
@@ -101,7 +111,7 @@ class MdToPdfStudioApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Only load a file if explicitly passed via CLI
-        if initial_file and os.path.isfile(initial_file):
+        if initial_file and Path(initial_file).is_file():
             self.load_markdown_file(Path(initial_file))
         else:
             self._draw_empty_preview_placeholder()
@@ -124,28 +134,28 @@ class MdToPdfStudioApp:
             "PaneHeader.TLabel",
             background="#1e293b",
             foreground="#f8fafc",
-            font=("Segoe UI", 9, "bold"),
+            font=(UI_FONT, 9, "bold"),
         )
         style.configure(
             "Badge.TLabel",
             background="#1e293b",
             foreground="#93c5fd",
-            font=("Segoe UI", 9),
+            font=(UI_FONT, 9),
         )
-        style.configure("Toolbar.TButton", font=("Segoe UI", 9), padding=(8, 4))
+        style.configure("Toolbar.TButton", font=(UI_FONT, 9), padding=(8, 4))
         style.configure(
-            "Primary.TButton", font=("Segoe UI", 9, "bold"), padding=(10, 4)
+            "Primary.TButton", font=(UI_FONT, 9, "bold"), padding=(10, 4)
         )
         style.configure(
             "Settings.TLabel",
             background="#e5e7eb",
             foreground="#1f2937",
-            font=("Segoe UI", 9),
+            font=(UI_FONT, 9),
         )
         style.configure(
             "Settings.TCheckbutton",
             background="#e5e7eb",
-            font=("Segoe UI", 9),
+            font=(UI_FONT, 9),
         )
 
     def _build_menu(self) -> None:
@@ -173,11 +183,15 @@ class MdToPdfStudioApp:
             label="Set Image Base Folder...", command=self.choose_base_dir
         )
         file_menu.add_command(
-            label="Insert Image...", accelerator="Ctrl+I", command=self.insert_image_dialog
+            label="Insert Image...",
+            accelerator="Ctrl+I",
+            command=self.insert_image_dialog,
         )
         file_menu.add_separator()
         file_menu.add_command(
-            label="Export PDF...", accelerator="Ctrl+E", command=self.export_pdf_dialog
+            label="Export PDF...",
+            accelerator="Ctrl+E",
+            command=self.export_pdf_dialog,
         )
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_close)
@@ -191,10 +205,14 @@ class MdToPdfStudioApp:
         )
         view_menu.add_separator()
         view_menu.add_command(
-            label="Zoom In", accelerator="Ctrl++", command=lambda: self.adjust_zoom(0.15)
+            label="Zoom In",
+            accelerator="Ctrl++",
+            command=lambda: self.adjust_zoom(0.15),
         )
         view_menu.add_command(
-            label="Zoom Out", accelerator="Ctrl+-", command=lambda: self.adjust_zoom(-0.15)
+            label="Zoom Out",
+            accelerator="Ctrl+-",
+            command=lambda: self.adjust_zoom(-0.15),
         )
         view_menu.add_command(
             label="Reset Zoom (100%)",
@@ -263,7 +281,7 @@ class MdToPdfStudioApp:
             activebackground="#1565c0",
             activeforeground="#ffffff",
             relief=tk.FLAT,
-            font=("Segoe UI", 9, "bold"),
+            font=(UI_FONT, 9, "bold"),
             padx=14,
             pady=4,
             cursor="hand2",
@@ -289,6 +307,7 @@ class MdToPdfStudioApp:
         )
         font_spin.pack(side=tk.LEFT, padx=(0, 10))
         font_spin.bind("<Return>", lambda _: self._on_option_changed())
+        font_spin.bind("<FocusOut>", lambda _: self._on_option_changed())
 
         ttk.Label(settings_bar, text="Margins:", style="Settings.TLabel").pack(
             side=tk.LEFT, padx=(0, 3)
@@ -317,6 +336,7 @@ class MdToPdfStudioApp:
         )
         w_spin.pack(side=tk.LEFT)
         w_spin.bind("<Return>", lambda _: self._on_option_changed())
+        w_spin.bind("<FocusOut>", lambda _: self._on_option_changed())
 
         ttk.Label(settings_bar, text="×", style="Settings.TLabel").pack(
             side=tk.LEFT, padx=2
@@ -332,6 +352,7 @@ class MdToPdfStudioApp:
         )
         h_spin.pack(side=tk.LEFT, padx=(0, 12))
         h_spin.bind("<Return>", lambda _: self._on_option_changed())
+        h_spin.bind("<FocusOut>", lambda _: self._on_option_changed())
 
         ttk.Checkbutton(
             settings_bar,
@@ -368,7 +389,9 @@ class MdToPdfStudioApp:
         left_header.pack(side=tk.TOP, fill=tk.X)
 
         self.lbl_editor_title = ttk.Label(
-            left_header, text="Markdown Editor — Untitled.md", style="PaneHeader.TLabel"
+            left_header,
+            text="Markdown Editor — Untitled.md",
+            style="PaneHeader.TLabel",
         )
         self.lbl_editor_title.pack(side=tk.LEFT)
 
@@ -383,7 +406,7 @@ class MdToPdfStudioApp:
             editor_container,
             wrap=tk.WORD,
             undo=True,
-            font=("Leelawadee UI", 10),
+            font=(EDITOR_FONT, 10),
             bg="#ffffff",
             fg="#1e293b",
             insertbackground="#0d47a1",
@@ -404,16 +427,16 @@ class MdToPdfStudioApp:
 
         # Configure Markdown syntax highlight tags
         self.editor.tag_configure(
-            "md_h1", foreground="#0d47a1", font=("Leelawadee UI", 12, "bold")
+            "md_h1", foreground="#0d47a1", font=(EDITOR_FONT, 12, "bold")
         )
         self.editor.tag_configure(
-            "md_h2", foreground="#1565c0", font=("Leelawadee UI", 11, "bold")
+            "md_h2", foreground="#1565c0", font=(EDITOR_FONT, 11, "bold")
         )
         self.editor.tag_configure(
-            "md_h3", foreground="#1d4ed8", font=("Leelawadee UI", 10, "bold")
+            "md_h3", foreground="#1d4ed8", font=(EDITOR_FONT, 10, "bold")
         )
         self.editor.tag_configure(
-            "md_bold", foreground="#0f172a", font=("Leelawadee UI", 10, "bold")
+            "md_bold", foreground="#0f172a", font=(EDITOR_FONT, 10, "bold")
         )
         self.editor.tag_configure("md_img", foreground="#047857", background="#ecfdf5")
         self.editor.tag_configure("md_code", foreground="#b91c1c", background="#fef2f2")
@@ -425,7 +448,9 @@ class MdToPdfStudioApp:
         right_frame = ttk.Frame(self.paned)
         self.paned.add(right_frame, weight=1)
 
-        right_header = ttk.Frame(right_frame, style="PaneHeader.TFrame", padding=(10, 4))
+        right_header = ttk.Frame(
+            right_frame, style="PaneHeader.TFrame", padding=(10, 4)
+        )
         right_header.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Label(
@@ -449,7 +474,7 @@ class MdToPdfStudioApp:
                 activebackground="#475569",
                 activeforeground="#ffffff",
                 relief=tk.FLAT,
-                font=("Segoe UI", 8),
+                font=(UI_FONT, 8),
                 padx=6,
                 pady=1,
                 command=cmd,
@@ -460,7 +485,7 @@ class MdToPdfStudioApp:
             textvariable=self.var_zoom_label,
             bg="#1e293b",
             fg="#e2e8f0",
-            font=("Segoe UI", 8, "bold"),
+            font=(UI_FONT, 8, "bold"),
             width=5,
         ).pack(side=tk.LEFT, padx=2)
 
@@ -476,7 +501,7 @@ class MdToPdfStudioApp:
                 activebackground="#475569",
                 activeforeground="#ffffff",
                 relief=tk.FLAT,
-                font=("Segoe UI", 8),
+                font=(UI_FONT, 8),
                 padx=6,
                 pady=1,
                 command=cmd,
@@ -508,8 +533,8 @@ class MdToPdfStudioApp:
         preview_hscroll.pack(side=tk.BOTTOM, fill=tk.X)
         self.preview_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Mousewheel scrolling on preview canvas (Windows & Linux)
-        self.preview_canvas.bind("<Configure>", lambda _: self._redraw_preview_canvas())
+        # Mousewheel & resize bindings on preview canvas (Windows & Linux)
+        self.preview_canvas.bind("<Configure>", self._on_canvas_configure)
         self.preview_canvas.bind("<MouseWheel>", self._on_preview_mousewheel)
         self.preview_canvas.bind(
             "<Button-4>", lambda e: self._on_linux_scroll(e, direction=-1)
@@ -527,7 +552,7 @@ class MdToPdfStudioApp:
             textvariable=self.var_status,
             bg="#0f172a",
             fg="#e2e8f0",
-            font=("Segoe UI", 9),
+            font=(UI_FONT, 9),
             anchor="w",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -535,7 +560,8 @@ class MdToPdfStudioApp:
         self.root.bind("<Control-n>", lambda _: self.new_document())
         self.root.bind("<Control-o>", lambda _: self.open_file_dialog())
         self.root.bind("<Control-s>", lambda _: self.save_file())
-        self.root.bind("<Control-S>", lambda _: self.save_file_as())
+        self.root.bind("<Control-Shift-S>", lambda _: self.save_file_as())
+        self.root.bind("<Control-Shift-s>", lambda _: self.save_file_as())
         self.root.bind("<Control-i>", lambda _: self.insert_image_dialog())
         self.root.bind("<Control-e>", lambda _: self.export_pdf_dialog())
         self.root.bind("<F5>", lambda _: self.trigger_preview_render())
@@ -572,6 +598,7 @@ class MdToPdfStudioApp:
         self._update_header_labels()
         self._raw_pil_pages.clear()
         self._tk_page_images.clear()
+        self._scaled_img_cache.clear()
         self.var_page_badge.set("No preview rendered")
         self.var_status.set("New document created.")
         self._draw_empty_preview_placeholder()
@@ -596,8 +623,8 @@ class MdToPdfStudioApp:
     def load_markdown_file(self, path: Path) -> None:
         try:
             resolved = path.resolve()
-            text = resolved.read_text(encoding="utf-8")
-        except Exception as exc:
+            text = resolved.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
             messagebox.showerror(
                 "Error Opening File",
                 f"Failed to read {path}:\n{exc}",
@@ -628,7 +655,7 @@ class MdToPdfStudioApp:
             self._update_header_labels()
             self.var_status.set(f"Saved {self.current_file}")
             return True
-        except Exception as exc:
+        except OSError as exc:
             messagebox.showerror(
                 "Save Error",
                 f"Could not save file:\n{exc}",
@@ -680,7 +707,6 @@ class MdToPdfStudioApp:
         chosen = Path(img_path).resolve()
         try:
             rel = chosen.relative_to(self.base_dir).as_posix()
-            # URL-encode spaces and parentheses while keeping forward slashes and µ readable
             parts = [urllib.parse.quote(p, safe="µ") for p in rel.split("/")]
             md_ref = "/".join(parts)
         except ValueError:
@@ -693,17 +719,17 @@ class MdToPdfStudioApp:
 
     def _build_conversion_options(self) -> ConversionOptions:
         try:
-            font_pt = float(self.var_font_size.get())
+            font_pt = min(14.0, max(7.5, float(self.var_font_size.get())))
         except (tk.TclError, ValueError):
             font_pt = 9.5
 
         try:
-            img_w = max(20, int(self.var_img_width.get()))
+            img_w = min(400, max(30, int(self.var_img_width.get())))
         except (tk.TclError, ValueError):
             img_w = 90
 
         try:
-            img_h = max(20, int(self.var_img_height.get()))
+            img_h = min(400, max(30, int(self.var_img_height.get())))
         except (tk.TclError, ValueError):
             img_h = 70
 
@@ -746,14 +772,40 @@ class MdToPdfStudioApp:
             return
 
         self.var_status.set(f"Exporting PDF to {out_path}...")
+        self.btn_export.config(state=tk.DISABLED)
         self.root.config(cursor="watch")
         self.root.update_idletasks()
 
-        try:
-            options = self._build_conversion_options()
-            res = render_pdf(md_text, str(self.base_dir), out_path, options)
-        except Exception as exc:
-            self.root.config(cursor="")
+        options = self._build_conversion_options()
+        base_dir_str = str(self.base_dir)
+        done_event = threading.Event()
+        outcome: dict[str, Any] = {}
+
+        def _export_worker() -> None:
+            try:
+                outcome["result"] = render_pdf(
+                    md_text, base_dir_str, out_path, options
+                )
+            except Exception as exc:  # noqa: BLE001
+                outcome["error"] = exc
+            finally:
+                done_event.set()
+
+        worker = threading.Thread(target=_export_worker, daemon=True)
+        worker.start()
+
+        # Keep Tkinter event loop responsive while export runs on worker thread
+        while not done_event.wait(timeout=0.02):
+            if self._closing:
+                return
+            with contextlib.suppress(tk.TclError):
+                self.root.update()
+
+        self.root.config(cursor="")
+        self.btn_export.config(state=tk.NORMAL)
+
+        if "error" in outcome:
+            exc = outcome["error"]
             messagebox.showerror(
                 "PDF Export Failed",
                 f"An error occurred while exporting the PDF:\n{exc}",
@@ -762,7 +814,7 @@ class MdToPdfStudioApp:
             self.var_status.set("PDF export failed.")
             return
 
-        self.root.config(cursor="")
+        res: ConversionResult = outcome["result"]
         suppressed_note = (
             f"\n• Suppressed missing images: {len(res.suppressed_images)}"
             if res.suppressed_images
@@ -784,13 +836,12 @@ class MdToPdfStudioApp:
             parent=self.root,
         )
         if open_now:
-            try:
+            with contextlib.suppress(OSError):
                 if sys.platform == "win32":
                     os.startfile(res.output_pdf_path)
                 elif sys.platform.startswith("linux"):
-                    subprocess.Popen(["xdg-open", res.output_pdf_path])
-            except OSError:
-                pass
+                    xdg = shutil.which("xdg-open") or "xdg-open"
+                    subprocess.Popen([xdg, res.output_pdf_path])
 
     # ------------------------------------------------------------------
     # Editor Events & Syntax Highlighting
@@ -802,7 +853,7 @@ class MdToPdfStudioApp:
         self.lbl_editor_title.configure(text=f"Markdown Editor — {name}{mod}")
         self.var_base_dir_label.set(f"Base Dir: {self.base_dir}")
 
-    def _on_editor_modified(self, _event: Optional[tk.Event] = None) -> None:
+    def _on_editor_modified(self, _event: tk.Event[Any] | None = None) -> None:
         if not self.editor.edit_modified():
             return
         self.editor.edit_modified(False)
@@ -830,12 +881,31 @@ class MdToPdfStudioApp:
             self._debounce_after_id = self.root.after(300, self.trigger_preview_render)
 
     def _apply_syntax_highlighting(self) -> None:
-        for tag in ("md_h1", "md_h2", "md_h3", "md_bold", "md_img", "md_code", "md_table"):
+        tags = (
+            "md_h1",
+            "md_h2",
+            "md_h3",
+            "md_bold",
+            "md_img",
+            "md_code",
+            "md_table",
+        )
+        for tag in tags:
             self.editor.tag_remove(tag, "1.0", tk.END)
 
         text = self.editor.get("1.0", "end-1c")
-        for line_idx, line in enumerate(text.splitlines(), start=1):
+        in_code_fence = False
+        for line_idx, line in enumerate(text.split("\n"), start=1):
             stripped = line.lstrip()
+            if stripped.startswith(("```", "~~~")):
+                in_code_fence = not in_code_fence
+                self.editor.tag_add("md_code", f"{line_idx}.0", f"{line_idx}.end")
+                continue
+
+            if in_code_fence:
+                self.editor.tag_add("md_code", f"{line_idx}.0", f"{line_idx}.end")
+                continue
+
             if stripped.startswith("# "):
                 self.editor.tag_add("md_h1", f"{line_idx}.0", f"{line_idx}.end")
             elif stripped.startswith("## "):
@@ -867,6 +937,7 @@ class MdToPdfStudioApp:
         if not md_text.strip():
             self._raw_pil_pages.clear()
             self._tk_page_images.clear()
+            self._scaled_img_cache.clear()
             self.var_page_badge.set("No preview rendered")
             self._draw_empty_preview_placeholder()
             return
@@ -875,14 +946,13 @@ class MdToPdfStudioApp:
         gen = self._render_generation
         options = self._build_conversion_options()
         base_dir_str = str(self.base_dir)
-        out_pdf_str = str(self._preview_pdf_path)
 
         self.var_status.set("Rendering print-styled A4 preview...")
         self.var_page_badge.set("Rendering...")
 
         worker = threading.Thread(
             target=self._background_render_worker,
-            args=(gen, md_text, base_dir_str, out_pdf_str, options),
+            args=(gen, md_text, base_dir_str, options),
             daemon=True,
         )
         worker.start()
@@ -892,23 +962,26 @@ class MdToPdfStudioApp:
         gen: int,
         md_text: str,
         base_dir_str: str,
-        out_pdf_str: str,
         options: ConversionOptions,
     ) -> None:
-        try:
-            # Use unique preview file per generation to avoid file locks
-            gen_pdf_path = str(self._temp_dir / f"_preview_{gen}.pdf")
-            res = render_pdf(md_text, base_dir_str, gen_pdf_path, options)
-            pil_pages = render_pdf_pages_to_pil(gen_pdf_path, dpi=115)
+        with self._render_lock:
+            if self._closing or gen != self._render_generation:
+                return
             try:
-                os.remove(gen_pdf_path)
-            except OSError:
-                pass
-            self._render_queue.put(("success", gen, res, pil_pages))
-        except Exception as exc:
-            self._render_queue.put(("error", gen, str(exc), []))
+                gen_pdf_path = self._temp_dir / f"_preview_{gen}.pdf"
+                res = render_pdf(md_text, base_dir_str, str(gen_pdf_path), options)
+                pil_pages = render_pdf_pages_to_pil(str(gen_pdf_path), dpi=115)
+                with contextlib.suppress(OSError):
+                    gen_pdf_path.unlink()
+                if not self._closing:
+                    self._render_queue.put(("success", gen, res, pil_pages))
+            except Exception as exc:  # noqa: BLE001
+                if not self._closing:
+                    self._render_queue.put(("error", gen, str(exc), []))
 
     def _poll_render_queue(self) -> None:
+        if self._closing:
+            return
         try:
             while True:
                 status, gen, payload, pil_pages = self._render_queue.get_nowait()
@@ -918,9 +991,12 @@ class MdToPdfStudioApp:
                     res: ConversionResult = payload
                     self._last_rendered_result = res
                     self._raw_pil_pages = pil_pages
+                    self._scaled_img_cache.clear()
+                    page_s = "s" if res.page_count != 1 else ""
+                    img_s = "s" if res.embedded_images != 1 else ""
                     self.var_page_badge.set(
-                        f"{res.page_count} page{'s' if res.page_count != 1 else ''} "
-                        f"| {res.embedded_images} image{'s' if res.embedded_images != 1 else ''}"
+                        f"{res.page_count} page{page_s} | "
+                        f"{res.embedded_images} image{img_s}"
                     )
                     suppressed_info = (
                         f" | Suppressed {len(res.suppressed_images)} missing image(s)"
@@ -939,7 +1015,20 @@ class MdToPdfStudioApp:
         except queue.Empty:
             pass
         finally:
-            self.root.after(100, self._poll_render_queue)
+            if not self._closing:
+                self.root.after(100, self._poll_render_queue)
+
+    def _on_canvas_configure(self, event: tk.Event[Any]) -> None:
+        new_w = event.width
+        if not self._raw_pil_pages:
+            self._draw_empty_preview_placeholder()
+            return
+        if abs(new_w - self._last_canvas_width) < 2:
+            return
+        self._last_canvas_width = new_w
+        if self._resize_after_id:
+            self.root.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.root.after(60, self._redraw_preview_canvas)
 
     def _draw_empty_preview_placeholder(self) -> None:
         self.preview_canvas.delete("all")
@@ -950,14 +1039,17 @@ class MdToPdfStudioApp:
             h // 2 - 12,
             text="A4 Print Preview Studio",
             fill="#cbd5e1",
-            font=("Segoe UI", 14, "bold"),
+            font=(UI_FONT, 14, "bold"),
         )
         self.preview_canvas.create_text(
             w // 2,
             h // 2 + 18,
-            text="Click 'Open .md...' or type Markdown on the left, then press F5 to preview.",
+            text=(
+                "Click 'Open .md...' or type Markdown on the left, "
+                "then press F5 to preview."
+            ),
             fill="#94a3b8",
-            font=("Segoe UI", 10),
+            font=(UI_FONT, 10),
         )
         self.preview_canvas.configure(scrollregion=(0, 0, w, h))
 
@@ -978,13 +1070,19 @@ class MdToPdfStudioApp:
         for idx, pil_img in enumerate(self._raw_pil_pages, start=1):
             scaled_w = max(100, int(pil_img.width * self._zoom_level))
             scaled_h = max(140, int(pil_img.height * self._zoom_level))
+            cache_key = (idx, scaled_w, scaled_h)
 
-            if abs(self._zoom_level - 1.0) > 0.01:
-                resized = pil_img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
-            else:
-                resized = pil_img
+            tk_img = self._scaled_img_cache.get(cache_key)
+            if tk_img is None:
+                if abs(self._zoom_level - 1.0) > 0.01:
+                    resized = pil_img.resize(
+                        (scaled_w, scaled_h), Image.Resampling.LANCZOS
+                    )
+                else:
+                    resized = pil_img
+                tk_img = ImageTk.PhotoImage(resized)
+                self._scaled_img_cache[cache_key] = tk_img
 
-            tk_img = ImageTk.PhotoImage(resized)
             self._tk_page_images.append(tk_img)
 
             x_center = max(scaled_w // 2 + 24, canvas_w // 2)
@@ -1011,7 +1109,7 @@ class MdToPdfStudioApp:
                 y0 + scaled_h + 14,
                 text=f"Page {idx} of {total_pages}",
                 fill="#cbd5e1",
-                font=("Segoe UI", 8, "bold"),
+                font=(UI_FONT, 8, "bold"),
             )
 
             y_cursor += scaled_h + 38
@@ -1024,7 +1122,7 @@ class MdToPdfStudioApp:
 
     def set_zoom(self, zoom: float) -> None:
         self._zoom_level = max(0.4, min(2.2, zoom))
-        self.var_zoom_label.set(f"{int(round(self._zoom_level * 100))}%")
+        self.var_zoom_label.set(f"{round(self._zoom_level * 100)}%")
         self._redraw_preview_canvas()
 
     def adjust_zoom(self, delta: float) -> None:
@@ -1043,7 +1141,7 @@ class MdToPdfStudioApp:
         sr = self.preview_canvas.cget("scrollregion").split()
         if len(sr) != 4:
             return
-        total_h = max(1, float(sr[3]))
+        total_h = max(1.0, float(sr[3]))
         curr_top = self.preview_canvas.yview()[0] * total_h
 
         # Find current visible page index
@@ -1058,14 +1156,19 @@ class MdToPdfStudioApp:
         target_y = self._page_y_coords[target_idx]
         self.preview_canvas.yview_moveto(target_y / total_h)
 
-    def _on_preview_mousewheel(self, event: tk.Event) -> None:
-        if event.state & 0x0004:  # Ctrl + MouseWheel zooms
+    def _on_preview_mousewheel(self, event: tk.Event[Any]) -> None:
+        ctrl_pressed = isinstance(event.state, int) and bool(event.state & 0x0004)
+        if ctrl_pressed:  # Ctrl + MouseWheel zooms
             self.adjust_zoom(0.1 if event.delta > 0 else -0.1)
-        else:
-            self.preview_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        elif event.delta != 0:
+            units = int(-event.delta / 120)
+            if units == 0:
+                units = -1 if event.delta > 0 else 1
+            self.preview_canvas.yview_scroll(units, "units")
 
-    def _on_linux_scroll(self, event: tk.Event, direction: int) -> None:
-        if event.state & 0x0004:  # Ctrl + Scroll zooms
+    def _on_linux_scroll(self, event: tk.Event[Any], direction: int) -> None:
+        ctrl_pressed = isinstance(event.state, int) and bool(event.state & 0x0004)
+        if ctrl_pressed:  # Ctrl + Scroll zooms
             self.adjust_zoom(-0.1 if direction > 0 else 0.1)
         else:
             self.preview_canvas.yview_scroll(direction, "units")
@@ -1077,12 +1180,22 @@ class MdToPdfStudioApp:
     def _on_close(self) -> None:
         if not self._confirm_discard_changes():
             return
+        self._closing = True
+        for after_id in (
+            self._debounce_after_id,
+            self._syntax_after_id,
+            self._resize_after_id,
+        ):
+            if after_id:
+                with contextlib.suppress(tk.TclError):
+                    self.root.after_cancel(after_id)
         if self._temp_dir.exists():
             shutil.rmtree(self._temp_dir, ignore_errors=True)
         self.root.destroy()
 
 
 def main() -> None:
+    """Launch the MD-to-PDF Desktop Studio GUI."""
     _enable_windows_hidpi()
     root = tk.Tk()
     initial_arg = sys.argv[1] if len(sys.argv) > 1 else None
