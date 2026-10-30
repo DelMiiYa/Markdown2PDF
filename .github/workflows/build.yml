@@ -8,6 +8,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -16,10 +19,12 @@ jobs:
         include:
           - os: windows-latest
             artifact_name: Markdown2PDF-windows.exe
-            binary_path: dist/Markdown2PDF.exe
+            binary_path: dist/Markdown2PDF-windows.exe
+            output_name: Markdown2PDF-windows.exe
           - os: ubuntu-latest
             artifact_name: Markdown2PDF-linux
-            binary_path: dist/Markdown2PDF
+            binary_path: dist/Markdown2PDF-linux
+            output_name: Markdown2PDF-linux
 
     runs-on: ${{ matrix.os }}
 
@@ -45,10 +50,17 @@ jobs:
 
       - name: Build standalone executable with PyInstaller
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name Markdown2PDF --collect-submodules markdown app.py
+          pyinstaller --noconfirm --clean --onefile --windowed --name ${{ matrix.output_name }} --collect-submodules markdown app.py
 
       - name: Upload executable artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.binary_path }}
+
+      - name: Publish to GitHub Release on Tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.binary_path }}
+          generate_release_notes: true
