@@ -53,7 +53,7 @@ jobs:
 
       - name: Run automated test suite
         run: |
-          pytest tests/test_converter.py -v
+          pytest -v
 
       - name: Build standalone executable with PyInstaller
         run: |

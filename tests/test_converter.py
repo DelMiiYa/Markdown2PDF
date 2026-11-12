@@ -23,8 +23,8 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import converter
-from converter import (
+from mdtopdf_core import converter
+from mdtopdf_core.converter import (
     MARGIN_PRESETS,
     ConversionOptions,
     ConversionResult,
@@ -378,7 +378,7 @@ def test_invalid_utf8_file_handling_and_surrogates(tmp_path: Path) -> None:
 
     out_pdf = tmp_path / "surrogate.pdf"
     with (
-        patch("converter.find_browser_executable", return_value="mock_browser"),
+        patch("mdtopdf_core.converter.find_browser_executable", return_value="mock_browser"),
         pytest.raises(UnicodeEncodeError),
     ):
         render_pdf("Bad surrogate: \ud800", str(tmp_path), str(out_pdf))
@@ -497,8 +497,8 @@ def test_output_path_browser_failure(tmp_path: Path) -> None:
     mock_proc = MagicMock(returncode=1, stderr="Permission denied writing PDF")
 
     with (
-        patch("converter.find_browser_executable", return_value="mock_edge.exe"),
-        patch("converter.subprocess.run", return_value=mock_proc),
+        patch("mdtopdf_core.converter.find_browser_executable", return_value="mock_edge.exe"),
+        patch("mdtopdf_core.converter.subprocess.run", return_value=mock_proc),
         pytest.raises(RuntimeError, match="Browser PDF rendering failed"),
     ):
         render_pdf("# Hello", str(tmp_path), str(out_pdf))
@@ -510,7 +510,7 @@ def test_output_path_locked_or_unwritable_directory(tmp_path: Path) -> None:
     invalid_out = blocker_file / "sub" / "out.pdf"
 
     with (
-        patch("converter.find_browser_executable", return_value="mock_edge.exe"),
+        patch("mdtopdf_core.converter.find_browser_executable", return_value="mock_edge.exe"),
         pytest.raises(OSError),
     ):
         render_pdf("# Test", str(tmp_path), str(invalid_out))
@@ -543,10 +543,10 @@ def test_temp_html_cleaned_up_on_browser_exception_and_timeout(tmp_path: Path) -
         return fd, path
 
     with (
-        patch("converter.find_browser_executable", return_value="mock_edge.exe"),
-        patch("converter.tempfile.mkstemp", side_effect=tracking_mkstemp),
+        patch("mdtopdf_core.converter.find_browser_executable", return_value="mock_edge.exe"),
+        patch("mdtopdf_core.converter.tempfile.mkstemp", side_effect=tracking_mkstemp),
         patch(
-            "converter.subprocess.run",
+            "mdtopdf_core.converter.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd="mock_edge.exe", timeout=60),
         ),
         pytest.raises(subprocess.TimeoutExpired),
@@ -858,8 +858,8 @@ def test_linux_browser_discovery_and_no_sandbox_flag(
 
     monkeypatch.setenv("CI", "true")
     with (
-        patch("converter.find_browser_executable", return_value="/usr/bin/chromium"),
-        patch("converter.subprocess.run", side_effect=fake_run),
+        patch("mdtopdf_core.converter.find_browser_executable", return_value="/usr/bin/chromium"),
+        patch("mdtopdf_core.converter.subprocess.run", side_effect=fake_run),
         pytest.raises(RuntimeError, match="Browser PDF rendering failed"),
     ):
         render_pdf("# Linux CI", str(tmp_path), str(tmp_path / "linux.pdf"))
@@ -890,9 +890,9 @@ def test_render_pdf_passes_devnull_and_isolation_flags(
     mock_doc.__getitem__.return_value = mock_page
 
     with (
-        patch("converter.find_browser_executable", return_value="dummy_browser.exe"),
-        patch("converter.subprocess.run", side_effect=fake_run),
-        patch("converter._open_pdf_with_retry", return_value=mock_doc),
+        patch("mdtopdf_core.converter.find_browser_executable", return_value="dummy_browser.exe"),
+        patch("mdtopdf_core.converter.subprocess.run", side_effect=fake_run),
+        patch("mdtopdf_core.converter._open_pdf_with_retry", return_value=mock_doc),
     ):
         res = render_pdf("# Heading", str(tmp_path), str(tmp_path / "out.pdf"))
 
@@ -926,7 +926,7 @@ def test_open_pdf_with_retry_retries_on_transient_error() -> None:
             raise PermissionError("File in use by scanner")
         return mock_doc
 
-    with patch("converter.pymupdf.open", side_effect=fake_open):
+    with patch("mdtopdf_core.converter.pymupdf.open", side_effect=fake_open):
         doc = converter._open_pdf_with_retry("dummy.pdf", retries=5, delay=0.01)
 
     assert doc is mock_doc

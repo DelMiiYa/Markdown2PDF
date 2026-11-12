@@ -27,7 +27,7 @@ from typing import Any
 
 from PIL import Image, ImageTk
 
-from converter import (
+from mdtopdf_core.converter import (
     MARGIN_PRESETS,
     ConversionOptions,
     ConversionResult,
